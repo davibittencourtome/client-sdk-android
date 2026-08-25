@@ -72,6 +72,23 @@ dokkaHtml {
     }
 }
 
+// Allow this module's Kotlin compilations to resolve `internal` APIs from :livekit-android-sdk
+// (backported from upstream main so the regression test can call the internal addSimulcastTrack)
+gradle.projectsEvaluated {
+    def sdk = rootProject.project(':livekit-android-sdk')
+    project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach { task ->
+        def variant
+        if (task.name.startsWith('compileDebug')) {
+            variant = 'Debug'
+        } else if (task.name.startsWith('compileRelease')) {
+            variant = 'Release'
+        } else {
+            return
+        }
+        task.friendPaths.from(sdk.tasks.named("bundleLibCompileToJar${variant}"))
+    }
+}
+
 dependencies {
 
     implementation(project(":livekit-android-sdk"))
