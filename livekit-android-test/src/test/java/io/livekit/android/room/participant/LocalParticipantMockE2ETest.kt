@@ -70,6 +70,7 @@ import livekit.org.webrtc.RtpParameters
 import livekit.org.webrtc.VideoSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -220,6 +221,36 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
     }
 
     @Test
+    fun addSimulcastTrackForAlreadyAddedCodecIsNoOp() = runTest {
+        val videoTrack = createLocalTrack()
+
+        val first = videoTrack.addSimulcastTrack(VideoCodec.VP8, emptyList())
+        val second = videoTrack.addSimulcastTrack(VideoCodec.VP8, emptyList())
+
+        assertNotNull(first)
+        assertNull(second)
+    }
+
+    @Test
+    fun duplicateSubscribedQualityUpdateDoesNotRepublishBackupCodec() = runTest {
+        room.videoTrackPublishDefaults = room.videoTrackPublishDefaults.copy(
+            videoCodec = VideoCodec.VP9.codecName,
+            scalabilityMode = "L3T3",
+            backupCodec = BackupVideoCodec(codec = VideoCodec.VP8.codecName),
+        )
+
+        connect()
+        val videoTrack = createLocalTrack()
+        room.localParticipant.publishVideoTrack(videoTrack)
+
+        val trackSid = room.localParticipant.videoTrackPublications.first().first.sid
+        receiveSubscribedQualityUpdate(trackSid)
+        receiveSubscribedQualityUpdate(trackSid)
+
+        assertEquals(2, getPublisherPeerConnection().transceivers.size)
+    }
+
+    @Test
     fun updateMetadata() = runTest {
         connect()
         val newMetadata = "new_metadata"
@@ -289,6 +320,32 @@ class LocalParticipantMockE2ETest : MockE2ETest() {
                 ParticipantEvent.AttributesChanged::class.java,
             ),
             participantEvents,
+        )
+    }
+
+    private fun receiveSubscribedQualityUpdate(trackSid: String) {
+        wsFactory.receiveMessage(
+            with(LivekitRtc.SignalResponse.newBuilder()) {
+                subscribedQualityUpdate = with(LivekitRtc.SubscribedQualityUpdate.newBuilder()) {
+                    this.trackSid = trackSid
+                    addAllSubscribedCodecs(
+                        listOf("vp9", "vp8").map { codecName ->
+                            with(SubscribedCodec.newBuilder()) {
+                                codec = codecName
+                                addQualities(
+                                    SubscribedQuality.newBuilder()
+                                        .setQuality(LivekitModels.VideoQuality.HIGH)
+                                        .setEnabled(true)
+                                        .build(),
+                                )
+                                build()
+                            }
+                        },
+                    )
+                    build()
+                }
+                build().toOkioByteString()
+            },
         )
     }
 
