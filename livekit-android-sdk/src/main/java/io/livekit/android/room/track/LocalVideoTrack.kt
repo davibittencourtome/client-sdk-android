@@ -344,7 +344,12 @@ constructor(
                 val encodings = parameters.encodings ?: return@executeBlockingOnRTCThread
                 var hasChanged = false
 
-                if (encodings.firstOrNull()?.scalabilityMode != null) {
+                // SVC is a single encoding without a rid that carries every layer. VP9/AV1
+                // published as rid based simulcast also set scalabilityMode, on each layer, and
+                // are paused per layer like any other simulcast.
+                val isSvc = encodings.firstOrNull()?.scalabilityMode != null &&
+                    encodings.all { it.rid.isNullOrEmpty() }
+                if (isSvc) {
                     val encoding = encodings.first()
                     var maxQuality = ProtoVideoQuality.OFF
                     for (quality in qualities) {

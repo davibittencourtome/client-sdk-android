@@ -45,6 +45,8 @@ import io.livekit.android.room.datatrack.DataTrackSchemaId
 import io.livekit.android.room.datatrack.LocalDataTrack
 import io.livekit.android.room.datatrack.OutgoingDataTrackManager
 import io.livekit.android.room.isSVCCodec
+import io.livekit.android.room.isSVCSimulcast
+import io.livekit.android.room.isSVCSimulcastSupportedByServer
 import io.livekit.android.room.rpc.RpcClientManager
 import io.livekit.android.room.rpc.RpcManager
 import io.livekit.android.room.rpc.RpcServerManager
@@ -589,9 +591,26 @@ internal constructor(
                 options = options.copy(scalabilityMode = "L1T3")
             }
         }
+
+        // VP9/AV1 can also be published as rid based simulcast, one spatial layer per stream,
+        // so the server has smaller versions to forward to subscribers with little bandwidth.
+        val svcSimulcast = useSVCSimulcast(options)
+        if (isSVC && isSVCSimulcast(options.videoCodec, options.simulcast, options.scalabilityMode)) {
+            if (svcSimulcast) {
+                LKLog.i { "publishing ${options.videoCodec} as simulcast (${options.scalabilityMode} per layer), server ${engine.serverVersion}" }
+            } else {
+                LKLog.i { "SVC simulcast is not supported by server ${engine.serverVersion}, publishing ${options.videoCodec} as SVC (${options.scalabilityMode})" }
+            }
+        }
+
         val encodings = computeVideoEncodings(track.options.isScreencast, track.dimensions, options)
         val videoLayers =
-            EncodingUtils.videoLayersFromEncodings(track.dimensions.width, track.dimensions.height, encodings, isSVC)
+            EncodingUtils.videoLayersFromEncodings(
+                track.dimensions.width,
+                track.dimensions.height,
+                encodings,
+                isSVC && !svcSimulcast,
+            )
 
         var publication: LocalTrackPublication? = null
         try {
@@ -608,6 +627,9 @@ internal constructor(
                         with(SimulcastCodec.newBuilder()) {
                             codec = options.videoCodec
                             cid = rtcTrackId
+                            if (svcSimulcast) {
+                                videoLayerMode = LivekitModels.VideoLayer.Mode.ONE_SPATIAL_LAYER_PER_STREAM
+                            }
                             build()
                         },
                     )
@@ -761,9 +783,10 @@ internal constructor(
             val finalOptions = options
             // Handle trackBitrates - apply start bitrate for all video codecs to prevent initial blurriness.
             // - SVC codecs: use first encoding's bitrate (single stream with built-in layers)
-            // - Simulcast: sum all encoding bitrates (independent streams, BWE needs total)
+            // - Simulcast: sum all encoding bitrates (independent streams, BWE needs total),
+            //   including VP9/AV1 published as rid based simulcast
             if (encodings.isNotEmpty() && finalOptions is VideoTrackPublishOptions) {
-                val targetBitrateBps: Long = if (isSVCCodec(finalOptions.videoCodec)) {
+                val targetBitrateBps: Long = if (isSVCCodec(finalOptions.videoCodec) && !useSVCSimulcast(finalOptions)) {
                     (encodings.firstOrNull()?.maxBitrateBps ?: 0).toLong()
                 } else {
                     encodings.sumOf { (it.maxBitrateBps ?: 0).toLong() }
@@ -894,6 +917,16 @@ internal constructor(
         return publication
     }
 
+    /**
+     * Whether [options] publish VP9/AV1 as rid based simulcast: the caller asked for it
+     * (simulcast with an `L1T*` scalability mode) and the server supports it. Otherwise
+     * SVC codecs keep the single SVC encoding.
+     */
+    private fun useSVCSimulcast(options: BaseVideoTrackPublishOptions): Boolean {
+        return isSVCSimulcast(options.videoCodec, options.simulcast, options.scalabilityMode) &&
+            isSVCSimulcastSupportedByServer(engine.serverVersion)
+    }
+
     private fun computeVideoEncodings(
         isScreenShare: Boolean,
         dimensions: Track.Dimensions,
@@ -903,6 +936,8 @@ internal constructor(
         var originalEncoding = options.videoEncoding
         val simulcast = options.simulcast
         val scalabilityMode = options.scalabilityMode
+        // VP9/AV1 published as rid based simulcast rather than SVC, see isSVCSimulcast
+        val svcSimulcast = useSVCSimulcast(options)
 
         if ((originalEncoding == null && !simulcast) || width == 0 || height == 0) {
             return emptyList()
@@ -915,7 +950,7 @@ internal constructor(
 
         val encodings = mutableListOf<RtpParameters.Encoding>()
 
-        if (scalabilityMode != null && isSVCCodec(options.videoCodec)) {
+        if (scalabilityMode != null && isSVCCodec(options.videoCodec) && !svcSimulcast) {
             val rtpEncoding = originalEncoding.toRtpEncoding()
             rtpEncoding.scalabilityMode = scalabilityMode
             encodings.add(rtpEncoding)
@@ -972,6 +1007,17 @@ internal constructor(
                 addEncoding(midPreset.encoding.copy(maxFps = min(midPreset.encoding.maxFps, maxFps)), midScale)
             }
             addEncoding(originalEncoding, 1.0)
+
+            if (svcSimulcast) {
+                // libwebrtc only treats several encodings of an SVC capable codec as real
+                // simulcast when every encoding carries its own scalabilityMode next to its
+                // scaleResolutionDownBy; otherwise they are read as legacy SVC. The mode
+                // defines the temporal layers, so the fixed numTemporalLayers is dropped.
+                for (encoding in encodings) {
+                    encoding.scalabilityMode = scalabilityMode
+                    encoding.numTemporalLayers = null
+                }
+            }
         } else {
             encodings.add(originalEncoding.toRtpEncoding())
         }
@@ -1691,8 +1737,11 @@ abstract class BaseVideoTrackPublishOptions {
     abstract val videoCodec: String
 
     /**
-     * scalability mode for svc codecs, defaults to 'L3T3'.
-     * for svc codecs, simulcast is disabled.
+     * scalability mode for svc codecs, defaults to 'L3T3_KEY'.
+     *
+     * With [simulcast] enabled and a single spatial layer mode (`L1T*`), VP9/AV1 are
+     * published as rid based simulcast with this mode on every layer, when the server
+     * supports it (newer than v1.13.6). Otherwise simulcast is disabled for svc codecs.
      */
     abstract val scalabilityMode: String?
 
